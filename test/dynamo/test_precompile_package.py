@@ -314,6 +314,21 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         self.assertIs(namespaces["G['__import_torch']"], torch)
         self.assertIs(namespaces["G['mypkg'].layers"], layers)
 
+    @parametrize("shape", sorted(_RISKY_DROP_CASES))
+    def test_risky_drop_decision_table(self, shape):
+        risky, source, value, kw = _RISKY_DROP_CASES[shape]
+        entry = _entry(source, value, **kw)
+        modules = [
+            (GlobalSource("F"), F),
+            (GlobalSource("math"), math),
+            (_OWN, sys.modules[__name__]),
+            (GlobalSource("impl"), types.ModuleType("mypkg.impl_b")),
+            (GlobalSource("config"), torch._dynamo.config),
+        ]
+        entries = [_entry(s, m) for s, m in modules] + [entry]
+        namespaces = dynamo_package_lint._module_namespaces(entries)
+        self.assertEqual(dynamo_package_lint._is_risky_drop(entry, namespaces), risky)
+
 
 instantiate_parametrized_tests(TestPrecompilePackage)
 
