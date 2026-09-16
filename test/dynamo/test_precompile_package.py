@@ -1,9 +1,14 @@
 # Owner(s): ["module: dynamo"]
 
+import importlib.machinery
 import math
 import os
+import sys
+import sysconfig
 import traceback
+import types
 import xml.parsers.expat  # noqa: F401
+from unittest import mock
 
 import numpy
 
@@ -21,7 +26,10 @@ from torch._dynamo.source import (
 )
 from torch._dynamo.types import GuardFilterEntry
 from torch._guards import Guard
-from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 
 
 def _user_op(x):
@@ -136,6 +144,63 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         self.assertTrue(within(root, (root,)))
         self.assertTrue(within(os.path.join(root, "c"), (root,)))
         self.assertFalse(within(root + "c", (root,)))
+
+    def test_library_module_requires_the_name_to_resolve_to_the_stdlib(self):
+        # The risky-drop waiver keys on the OWNER's module name, and a name is
+        # not an identity: graphlib, queue, code and distutils are all stdlib
+        # names a third party ships, and purelib NESTS inside stdlib (conda) or
+        # platstdlib (venv), so a __file__ prefix check waived every shadow.
+        self.addCleanup(dynamo_package_lint._classify_file.cache_clear)
+        stdlib_root = sysconfig.get_paths()["stdlib"]
+
+        def fake(name, **attrs):
+            module = types.ModuleType(name)
+            module.__dict__.update(attrs)
+            return module
+
+        def is_library(name, module):
+            with mock.patch.dict(sys.modules, {name: module}):
+                return dynamo_package_lint._is_library_module(name)
+
+        site_packages = os.path.join(stdlib_root, "site-packages")
+        shadows = {
+            "under an install dir": fake("graphlib", __file__=os.path.join(site_packages, "graphlib", "__init__.py")),
+            "no __file__, no __spec__": fake("graphlib"),
+            "relative __file__": fake("graphlib", __file__="graphlib.py"),
+            "namespace package": fake("graphlib", __spec__=importlib.machinery.ModuleSpec("graphlib", None, is_package=True)),
+        }  # fmt: skip
+        for label, module in shadows.items():
+            self.assertFalse(is_library("graphlib", module), label)
+        # An install root nested inside the stdlib root with no site-packages
+        # component in the path: only the _install_roots exclusion catches it.
+        vendored = os.path.join(stdlib_root, "vendored")
+        nested = fake(
+            "graphlib", __file__=os.path.join(vendored, "graphlib", "__init__.py")
+        )
+        for install_roots, expected in (
+            ((dynamo_package_lint._norm(vendored),), False),
+            ((), True),
+        ):
+            dynamo_package_lint._classify_file.cache_clear()
+            with mock.patch.object(
+                dynamo_package_lint, "_install_roots", return_value=install_roots
+            ):
+                self.assertEqual(
+                    is_library("graphlib", nested), expected, install_roots
+                )
+        # A located parent does not vouch for a descendant located elsewhere.
+        shadowed_sub = fake(
+            "collections.abc", __file__=os.path.join(site_packages, "abc.py")
+        )
+        self.assertFalse(is_library("collections.abc", shadowed_sub))
+        self.assertFalse(dynamo_package_lint._is_library_module("not_a_stdlib_name"))
+        self.assertFalse(dynamo_package_lint._is_library_module(None))
+
+    @parametrize("name", _LIBRARY_NAMES)
+    def test_library_module_keeps_the_waiver_for_the_real_library(self, name):
+        self.assertTrue(
+            dynamo_package_lint._is_library_module(name), f"{name} lost its waiver"
+        )
 
     def test_unrepointable_binding_predicates(self):
         reads_a_builtin = dynamo_package_lint._reads_a_builtin
