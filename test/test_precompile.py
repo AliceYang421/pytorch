@@ -90,6 +90,80 @@ class TestPrecompile(TestCase):
         joined = GuardFact("GRAD_MODE", "", ("a", "b"), "", True)
         self.assertEqual(joined.render(), "[enforced] a ; b")
 
+    def test_summary_types_pickle(self):
+        # A capture summary or invariants report is the kind of value users
+        # stash next to an artifact (torch.save of a diagnostics record, a
+        # multiprocessing capture farm), so every instance must round-trip
+        # through pickle, which resolves the class through its __module__.
+        from torch.compiler._precompile_types import (
+            FrameInvariants,
+            GuardFact,
+            PrecompileSummary,
+        )
+
+        fact = GuardFact("TYPE_MATCH", "L['x']", ("code",), "is int", True)
+        inv = FrameInvariants("f", "f.py", 1, 2, (fact,), (), ())
+        summary = PrecompileSummary(
+            frames=1, resume_functions=0, guarded_codes=1, backend_graphs=1
+        )
+        for obj in (fact, inv, summary):
+            self.assertEqual(pickle.loads(pickle.dumps(obj)), obj)
+
+    def test_summary_complete_requires_every_term(self):
+        from torch.compiler._precompile_types import PrecompileSummary
+
+        def summary(**kw):
+            base = dict(frames=1, resume_functions=0, guarded_codes=1, backend_graphs=1)
+            base.update(kw)
+            return PrecompileSummary(**base)
+
+        self.assertTrue(summary().complete)
+        self.assertFalse(summary(backend_graphs=0).complete)
+        self.assertFalse(summary(guarded_codes=0).complete)
+        self.assertFalse(summary(capture_errors=("boom",)).complete)
+        self.assertFalse(summary(bypassed=("f",)).complete)
+        self.assertFalse(summary(truncated=("f",)).complete)
+        self.assertFalse(summary(uncovered_frames=("f",)).complete)
+
+    def test_summary_digest_and_guard_type_counts(self):
+        from torch.compiler._precompile_types import PrecompileSummary
+
+        plain = PrecompileSummary(
+            frames=2,
+            resume_functions=1,
+            guarded_codes=3,
+            backend_graphs=2,
+            dropped_guards=(
+                ("ID_MATCH", "G['fn']"),
+                ("ID_MATCH", "G['g']"),
+                ("HASATTR", "L['m']"),
+            ),
+            kept_guards=(("TYPE_MATCH", "L['x']"), ("TENSOR_MATCH", "L['x']")),
+            wont_generalize=("L['scale']",),
+        )
+        self.assertEqual(plain.dropped_guard_types(), {"ID_MATCH": 2, "HASATTR": 1})
+        self.assertEqual(plain.kept_guard_types(), {"TYPE_MATCH": 1, "TENSOR_MATCH": 1})
+        self.assertExpectedInline(
+            str(plain),
+            """2 frames (1 from graph breaks), 3 guarded codes, 2 backend graphs, dropped guards {'ID_MATCH': 2, 'HASATTR': 1}, 1 value-pinned guards""",
+        )
+        bad = PrecompileSummary(
+            frames=3,
+            resume_functions=0,
+            guarded_codes=1,
+            backend_graphs=1,
+            bypassed=("gen",),
+            truncated=("loop",),
+            uncovered_frames=("helper",),
+            risky_dropped_guards=(("ID_MATCH", "L['self'].act"),),
+            capture_errors=("boom",),
+        )
+        self.assertFalse(bad.complete)
+        self.assertExpectedInline(
+            str(bad),
+            """3 frames (0 from graph breaks), 1 guarded codes, 1 backend graphs, RISKY drops ["L['self'].act"], 1 UNCOVERED: ['helper'], >=1 TRUNCATED: ['loop'], 1 BYPASSED: ['gen'], 1 CAPTURE ERROR(S)""",
+        )
+
     def test_decompositions_kwarg(self):
         # The decompositions table is threaded into make_fx during capture; a
         # custom decomposition is invoked and the result still matches eager.
