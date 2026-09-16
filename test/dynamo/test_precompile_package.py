@@ -137,6 +137,86 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         self.assertTrue(within(os.path.join(root, "c"), (root,)))
         self.assertFalse(within(root + "c", (root,)))
 
+    def test_unrepointable_binding_predicates(self):
+        reads_a_builtin = dynamo_package_lint._reads_a_builtin
+        self.assertTrue(reads_a_builtin(DictGetItemSource(_BUILTINS_DICT, "len"), len))
+        # A builtin parked in a slot, a user table keyed by a builtin's name and
+        # user code injected into builtins are all reads from a slot.
+        self.assertFalse(reads_a_builtin(AttrSource(LocalSource("self"), "act"), abs))
+        self.assertFalse(
+            reads_a_builtin(DictGetItemSource(GlobalSource("_OPS"), "len"), len)
+        )
+        self.assertFalse(
+            reads_a_builtin(DictGetItemSource(_BUILTINS_DICT, "op"), _user_op)
+        )
+
+        synthesized = dynamo_package_lint._is_dynamo_synthesized
+        self.assertTrue(
+            synthesized(GetItemSource(LocalSource("__nested_frame_values"), 0))
+        )
+        self.assertTrue(synthesized(LocalSource("__nested_resume_fns")))
+        # A global spelled like one is a user binding.
+        self.assertFalse(synthesized(GlobalSource("__nested_frame_values")))
+        self.assertFalse(synthesized(LocalSource("x")))
+
+        alias_module = dynamo_package_lint._dynamo_alias_module
+        self.assertIs(alias_module("__import_torch_dot_nn_dot_functional"), F)
+        self.assertIsNone(alias_module("F"))
+        owning_module = dynamo_package_lint._owning_module
+        self.assertEqual(owning_module(F), "torch.nn.functional")
+        self.assertEqual(owning_module(F.gelu), "torch._C._nn")
+        self.assertIsNone(owning_module(3))
+
+        defined_where_read = dynamo_package_lint._defined_where_read
+        self.assertTrue(defined_where_read(_user_op, _HERE))
+        # Paths are compared normalized, so another spelling of the file matches.
+        unnormalized = os.path.join(
+            os.path.dirname(__file__), os.curdir, os.path.basename(__file__)
+        )
+        stack = traceback.StackSummary.from_list([(unnormalized, 1, "forward", "")])
+        self.assertTrue(defined_where_read(_user_op, stack))
+        self.assertFalse(defined_where_read(_user_op, _ELSEWHERE))
+        self.assertFalse(defined_where_read(_user_op, None))
+        self.assertFalse(defined_where_read(F.silu, _HERE))
+
+    def test_minted_global_names_match_dynamo(self):
+        # The predicates restate names Dynamo mints inline, in
+        # install_builtins_dict_in_fglobals and import_source; a rename there
+        # must fail here rather than silently turn the lint off.
+        seen = []
+
+        def record(entries):
+            seen.extend(entries)
+            return [True] * len(entries)
+
+        lin = torch.nn.Linear(2, 2)
+
+        def fn(x):
+            return lin(x) + len(x.shape)
+
+        compiled = torch.compile(
+            fn, backend="eager", options={"guard_filter_fn": record}
+        )
+        compiled(torch.ones(2))
+        reads_a_builtin = dynamo_package_lint._reads_a_builtin
+        self.assertTrue(
+            any(reads_a_builtin(e.orig_guard.originating_source, e.value) for e in seen)
+        )
+        roots = {
+            dynamo_package_lint._source_root(e.orig_guard.originating_source)
+            for e in seen
+        }
+        aliases = {
+            r.global_name
+            for r in roots
+            if isinstance(r, GlobalSource) and r.global_name.startswith("__import_")
+        }
+        alias = "__import_torch_dot_nn_dot_modules_dot_linear"
+        self.assertIn(alias, aliases)
+        self.assertIs(
+            dynamo_package_lint._dynamo_alias_module(alias), torch.nn.modules.linear
+        )
+
 
 instantiate_parametrized_tests(TestPrecompilePackage)
 

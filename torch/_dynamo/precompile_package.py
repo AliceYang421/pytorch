@@ -107,12 +107,17 @@ import os
 import site
 import sys
 import sysconfig
+import types
 from typing import TYPE_CHECKING
 
+from torch._guards import ChainedSource, Source
+
 from .guards import CheckFunctionManager
+from .source import DictGetItemSource, GlobalSource, LocalSource
 
 
 if TYPE_CHECKING:
+    import traceback
     from collections.abc import Callable, Sequence
 
     from .types import GuardFilterEntry
@@ -181,6 +186,29 @@ def default_guard_filter_fn(
         and not any(d in unsupported for d in g.derived_guard_types)
         for g in guard_entries
     ]
+
+
+def _owning_module(value: object) -> str | None:
+    if isinstance(value, types.ModuleType):
+        return value.__name__
+    owner = getattr(value, "__module__", None)
+    return owner if isinstance(owner, str) else None
+
+
+def _source_root(source: Source) -> Source:
+    return source.get_base() if isinstance(source, ChainedSource) else source
+
+
+# Locals Dynamo synthesizes when a resume function is itself nested, passed
+# positionally into the continuation (resume_execution.py builds the list).
+# They name generated code, not a slot any config chooses, so an identity guard
+# lost on one cannot diverge.
+_DYNAMO_SYNTHESIZED = ("__nested_resume_fns", "__nested_frame_values")
+
+
+def _is_dynamo_synthesized(source: Source) -> bool:
+    root = _source_root(source)
+    return isinstance(root, LocalSource) and root.local_name in _DYNAMO_SYNTHESIZED
 
 
 def _norm(path: str) -> str:
@@ -258,3 +286,59 @@ def _torch_roots() -> tuple[str, ...]:
 def _within(path: str, roots: tuple[str, ...]) -> bool:
     """Prefix test over ``_norm``-ed paths; the caller normalizes both sides."""
     return any(path == r or path.startswith(r + os.sep) for r in roots)
+
+
+def _defined_where_read(
+    value: object, user_stack: traceback.StackSummary | None
+) -> bool:
+    """
+    Whether the def lives in the file of the frame that read it.
+
+    The caller has already matched the value's ``__name__`` to the global it
+    was read from; this adds the WHERE. A def bound to its own name in its OWN
+    module takes an edit there to repoint. ``from impl_a import op`` takes only
+    a conditional import in the reader, which is not an edit at all and which
+    no checksum covers.
+    """
+    home = sys.modules.get(_owning_module(value) or "")
+    file = getattr(home, "__file__", None)
+    if not user_stack or not isinstance(file, str):
+        return False
+    return _norm(file) == _norm(user_stack[-1].filename)
+
+
+def _dynamo_alias_module(global_name: str) -> types.ModuleType | None:
+    """
+    The module behind an ``__import_a_dot_b`` alias, mirroring import_source.
+
+    The OutputGraph's import_sources table is authoritative, but a guard entry
+    does not carry it; unmangling collides only for a module literally named
+    ``a_dot_b``.
+    """
+    prefix = "__import_"
+    if not global_name.startswith(prefix):
+        return None
+    return sys.modules.get(global_name[len(prefix) :].replace("_dot_", "."))
+
+
+# Dynamo's own handle on the builtins dict, minted by
+# OutputGraph.install_builtins_dict_in_fglobals.
+_BUILTINS_DICT_PREFIX = "__builtins_dict__"
+
+
+def _reads_a_builtin(source: Source, value: object) -> bool:
+    """
+    ``len`` or ``sorted`` reached the ordinary way, through the builtins dict
+    Dynamo installs to resolve them. No binding sits in front of those, so
+    nothing can repoint them.
+
+    A builtin parked in a slot -- ``self.act = abs``, straight out of an
+    ACT2FN-style table -- is a slot like any other, so this deliberately keys
+    on where the read comes FROM rather than on who owns the value.
+    """
+    return (
+        isinstance(source, DictGetItemSource)
+        and isinstance(source.base, GlobalSource)
+        and source.base.global_name.startswith(_BUILTINS_DICT_PREFIX)
+        and _owning_module(value) == "builtins"
+    )
