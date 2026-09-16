@@ -19,7 +19,7 @@ from torch.distributed.pipelining import (
     ScheduleLoopedBFS,
     ScheduleZBVZeroBubble,
 )
-from torch.distributed.pipelining._recv_buffers import _RecvInfo
+from torch.distributed.pipelining._recv_buffers import _RecvBufferPool, _RecvInfo
 from torch.distributed.pipelining._utils import (
     _TensorMeta,
     generate_stage_to_rank_mapping,
@@ -32,6 +32,7 @@ from torch.distributed.pipelining.schedules import (
     _add_send_recv,
     _add_unshard_reshard,
     _analyze_pipeline_resource_liveness,
+    _assign_pipeline_recv_buffer_slots,
     _batch_p2p,
     _defer_recv_ops,
     _format_pipeline_order,
@@ -193,15 +194,18 @@ class ScheduleTest(TestCase):
         stage.stage_index = 1
         stage.device = torch.device("cpu")
         stage._downstream_group = None
+        stage._fwd_recv_slots = {}
+        stage._fwd_recv_pool = _RecvBufferPool("forward")
         info = _RecvInfo(
             "activation", source=0, tensor_meta=_TensorMeta.from_tensor(torch.ones(2))
         )
+        stage.args_recv_info = {0: (info,)}
 
         with (
             patch.object(stage, "_resolve_peer_global_rank", return_value=0),
             patch("torch.distributed.pipelining.stage.dist.P2POp") as p2p,
         ):
-            ops = stage._get_recv_ops((info,), stage._downstream_group)
+            ops = stage.get_fwd_recv_ops(0)
 
         self.assertEqual(len(ops), 1)
         self.assertIsNotNone(info.buffer)
@@ -240,10 +244,132 @@ class ScheduleTest(TestCase):
             self.assertRaisesRegex(AssertionError, "info.source"),
         ):
             stage._get_recv_ops(
-                (valid_before_invalid, invalid_source), stage._downstream_group
+                1,
+                (valid_before_invalid, invalid_source),
+                {},
+                stage._fwd_recv_pool,
+                stage._downstream_group,
             )
         self.assertIsNone(valid_before_invalid.buffer)
         self.assertIsNone(invalid_source.buffer)
+
+        invalid_source = _RecvInfo(
+            "activation", source=None, tensor_meta=info.tensor_meta
+        )
+        stage.args_recv_info[1] = (invalid_source,)
+        stage._fwd_recv_slots = {1: 0}
+        stage._fwd_recv_pool.prepare(1, (invalid_source,), stage.device)
+        with self.assertRaisesRegex(AssertionError, "info.source"):
+            stage.get_fwd_recv_ops(1)
+        self.assertIsNone(invalid_source.buffer)
+        self.assertFalse(stage._fwd_recv_pool._owners)
+
+    def test_recv_buffer_pool_reuses_slots_and_detects_aliases(self):
+        meta = _TensorMeta.from_tensor(torch.ones(2))
+        info = _RecvInfo("activation", source=0, tensor_meta=meta)
+        pool = _RecvBufferPool("forward")
+        pool.prepare(2, (info,), torch.device("cpu"))
+
+        pool.acquire(0, 0, (info,))
+        first = info.take_buffer()
+        self.assertIsNotNone(first)
+        self.assertTrue(pool.aliases(first.view(-1)))
+        with self.assertRaisesRegex(PipeliningMetadataError, "owned by microbatch 0"):
+            pool.acquire(0, 1, (info,))
+        with self.assertRaisesRegex(
+            PipeliningMetadataError, "destroy the process group"
+        ):
+            pool.prepare(2, (info,), torch.device("cpu"))
+        pool.release(0, 0)
+
+        pool.acquire(0, 2, (info,))
+        self.assertEqual(info.take_buffer().data_ptr(), first.data_ptr())
+        with self.assertRaisesRegex(PipeliningMetadataError, "not 3"):
+            pool.release(0, 3)
+        pool.release(0, 2)
+        with self.assertRaisesRegex(PipeliningMetadataError, "is not active"):
+            pool.release(0, 2)
+        with self.assertRaisesRegex(PipeliningMetadataError, "out of range"):
+            pool.acquire(2, 3, (info,))
+
+        stage = MockPipelineStage(num_stages=1)
+        stage.stage_index = 0
+        stage._fwd_recv_pool = pool
+        stage._bwd_recv_pool = _RecvBufferPool("backward")
+        stage.fwd_cache = {0: ((first.view(-1),), [])}
+        stage.act_send_info = [[1]]
+        stage.log_prefix = "[Stage 0]"
+        stage._downstream_group = None
+        with (
+            patch.object(stage, "_resolve_peer_global_rank", return_value=1),
+            patch("torch.distributed.pipelining.stage.dist.P2POp") as p2p,
+        ):
+            stage.get_fwd_send_ops(0)
+        sent = p2p.call_args.args[1]
+        self.assertFalse(pool.aliases(sent))
+        self.assertEqual(sent, first)
+
+        backward_info = _RecvInfo("gradient", source=0, tensor_meta=meta)
+        stage._bwd_recv_pool.prepare(1, (backward_info,), torch.device("cpu"))
+        stage._bwd_recv_pool.acquire(0, 0, (backward_info,))
+        backward_buffer = backward_info.take_buffer()
+        owned_backward = stage._ensure_owned_send(backward_buffer.view(-1))
+        self.assertFalse(stage._bwd_recv_pool.aliases(owned_backward))
+        stage._bwd_recv_pool.release(0, 0)
+
+        independent = torch.ones(2)
+        self.assertIs(stage._ensure_owned_send(independent), independent)
+
+        stage.args_recv_info = {
+            0: (info,),
+            1: (
+                _RecvInfo(
+                    "activation",
+                    source=0,
+                    tensor_meta=_TensorMeta.from_tensor(torch.ones(3)),
+                ),
+            ),
+        }
+        with self.assertRaisesRegex(
+            PipeliningMetadataError, "microbatch 1, input 0 differs"
+        ):
+            stage._validate_uniform_recv_metadata(stage.args_recv_info, {0: 0, 1: 1})
+
+    def test_recv_buffer_slots_follow_schedule_lifetimes(self):
+        actions = [
+            _Action(1, RECV_F, 0),
+            _Action(1, F, 0),
+            _Action(1, RECV_F, 1),
+            _Action(1, F, 1),
+            _Action(1, RECV_B, 1),
+            _Action(1, RECV_B, 0),
+            _Action(1, W, 1),
+            _Action(1, RECV_F, 2),
+            _Action(1, F, 2),
+            _Action(1, RECV_F, 3),
+            _Action(1, B, 0),
+            _Action(1, RECV_B, 2),
+            _Action(1, B, 2),
+            _Action(1, RECV_B, 3),
+            _Action(1, B, 3),
+        ]
+        slots = _assign_pipeline_recv_buffer_slots(actions, has_backward=True)[1]
+
+        self.assertEqual(slots.forward, {0: 0, 1: 1, 2: 1, 3: 2})
+        self.assertEqual(slots.num_forward_slots, 3)
+        self.assertEqual(slots.backward, {1: 0, 0: 1, 2: 0, 3: 0})
+        self.assertEqual(slots.num_backward_slots, 2)
+
+        with self.assertRaisesRegex(ValueError, "appears more than once"):
+            _assign_pipeline_recv_buffer_slots(
+                [_Action(1, RECV_F, 0), _Action(1, RECV_F, 0)],
+                has_backward=True,
+            )
+        with self.assertRaisesRegex(ValueError, "have no release action"):
+            _assign_pipeline_recv_buffer_slots(
+                [_Action(1, RECV_F, 0)],
+                has_backward=True,
+            )
 
     def test_pipeline_resource_liveness_reuses_completed_slots(self):
         stage = MockPipelineStage(group_size=1, num_stages=1)
