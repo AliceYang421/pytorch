@@ -176,7 +176,7 @@ class FSDPParamGroup:
                 post_forward_mesh_info,
                 device,
                 shard_placement_fn,
-                mp_policy,
+                mp_policy._resolve_for_param(param),
                 offload_policy,
             )
             for param, module_info in zip(params, param_module_infos)
@@ -185,7 +185,6 @@ class FSDPParamGroup:
         self.post_forward_mesh_info = post_forward_mesh_info
         self.device = device
         self.device_handle = _get_device_handle(device.type)
-        self.mp_policy = mp_policy
         self.offload_policy = offload_policy
         self._training_state = TrainingState.IDLE
         # Group's sharded state always matches its parameters' sharded states
@@ -273,35 +272,39 @@ class FSDPParamGroup:
     # Initialization #
     def _init_mp_dtypes(self) -> None:
         for fsdp_param in self.fsdp_params:
-            fsdp_param.init_dtype_attrs(self.mp_policy)
+            fsdp_param.init_dtype_attrs(fsdp_param.mp_policy)
+        floating_params = [
+            p for p in self.fsdp_params if p.orig_dtype.is_floating_point
+        ]
         trainable_params: list[FSDPParam] = [
-            p for p in self.fsdp_params if p.sharded_param.requires_grad
+            p for p in floating_params if p.sharded_param.requires_grad
         ]
         if trainable_params:
-            params_for_dtype = trainable_params
+            params_for_orig_dtype = trainable_params
         else:
-            params_for_dtype = [
-                p for p in self.fsdp_params if p.orig_dtype.is_floating_point
-            ]
-        orig_dtypes = {p.orig_dtype for p in params_for_dtype}
-        reduce_dtypes = {p.reduce_dtype for p in params_for_dtype}
+            params_for_orig_dtype = floating_params
+        orig_dtypes = {p.orig_dtype for p in params_for_orig_dtype}
+        reduce_dtypes = {p.reduce_dtype for p in floating_params}
+        effective_reduce_dtypes = {p.unsharded_grad_dtype for p in floating_params}
         if len(trainable_params) > 0 and len(orig_dtypes) != 1:
             # Models may have no grad params
             raise AssertionError(
                 f"FSDP expects uniform original parameter dtype but got {orig_dtypes}"
             )
-        if len(trainable_params) > 0 and len(reduce_dtypes) != 1:
-            # This can be relaxed if we issue one reduce-scatter per reduce
-            # dtype (but we would need a way for users to specify multiple
-            # reduce dtypes)
-            raise AssertionError(
-                f"FSDP expects uniform reduce dtype but got {reduce_dtypes}"
+        self._orig_dtype = next(iter(orig_dtypes)) if len(orig_dtypes) == 1 else None
+        if len(effective_reduce_dtypes) > 1:
+            dtypes = ", ".join(sorted(str(dtype) for dtype in effective_reduce_dtypes))
+            raise NotImplementedError(
+                "FSDP does not support multiple effective reduce dtypes within a "
+                "parameter group; configure one common effective reduce dtype, "
+                f"including reduce_dtype_fn results, but got: {dtypes}"
             )
-        dtype_sets_are_uniform = len(orig_dtypes) == 1 and len(reduce_dtypes) == 1
-        self._orig_dtype = next(iter(orig_dtypes)) if dtype_sets_are_uniform else None
-        self._reduce_dtype = (
-            next(iter(reduce_dtypes)) if dtype_sets_are_uniform else None
-        )
+        if len(reduce_dtypes) == 1:
+            self._reduce_dtype = next(iter(reduce_dtypes))
+        elif len(effective_reduce_dtypes) == 1:
+            self._reduce_dtype = next(iter(effective_reduce_dtypes))
+        else:
+            self._reduce_dtype = None
 
     def lazy_init(self):
         # Lazy init should be idempotent
@@ -743,11 +746,7 @@ class FSDPParamGroup:
                     self._reduce_dtype,
                     self.device,
                     self.gradient_divide_factor,
-                    (
-                        self._all_reduce_process_group
-                        if isinstance(self.mesh_info, DDPMeshInfo)
-                        else None
-                    ),
+                    all_reduce_pg,
                     all_reduce_stream,
                     self.all_reduce_grads,
                     self._partial_reduce_output,
