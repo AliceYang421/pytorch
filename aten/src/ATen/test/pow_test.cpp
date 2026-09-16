@@ -142,7 +142,16 @@ void tensor_pow_scalar(const Vals vals, const Pows pows, const torch::ScalarType
 
     int i = 0;
     for (const auto val : vals) {
-      const auto exp = torch::pow(torch::tensor({val}, dtype), torch::tensor(pow, dtype)).template item<double>();
+      // A float tensor evaluates pow with a float exponent (see PowKernel.cpp),
+      // so the reference has to narrow the exponent the same way. Left in
+      // double, an odd integer exponent above 2^24 stays odd here while the
+      // kernel sees an even float, which flips the sign for negative bases.
+      const auto exp = valsDtype == torch::kFloat
+          ? torch::pow(torch::tensor({val}, dtype),
+                       torch::tensor(static_cast<float>(pow), dtype))
+                .template item<double>()
+          : torch::pow(torch::tensor({val}, dtype), torch::tensor(pow, dtype))
+                .template item<double>();
 
       const auto act_pow = actual_pow[i].to(at::kDouble).template item<double>();
       assert_eq<long double>(val, act_pow, exp);

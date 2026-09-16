@@ -75,12 +75,17 @@ void pow_tensor_scalar_optimized_kernel(TensorIteratorBase& iter, const exp_scal
         [](Vec base) -> Vec { return (base * base).reciprocal(); }
     );
   } else {
+    // Call std::powf when base is float, as it is done in the vectorized path
+    using exp_t = std::conditional_t<
+        std::is_same_v<scalar_t, float> && std::is_same_v<cast_scalar_t, double>,
+        scalar_t,
+        cast_scalar_t>;
     cpu_kernel_vec(iter,
         [=](scalar_t base) -> scalar_t {
-          return std::pow(base, static_cast<cast_scalar_t>(exp));
+          return std::pow(base, static_cast<exp_t>(exp));
         },
         [=](Vec base) -> Vec {
-          return base.pow(static_cast<cast_scalar_t>(exp));
+          return base.pow(static_cast<exp_t>(exp));
         }
     );
   }
