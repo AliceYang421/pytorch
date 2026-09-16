@@ -694,6 +694,9 @@ class TORCH_API Backend : public torch::CustomClassHolder {
         " is missing implementation of enableCollectivesTiming.");
   }
 
+  // The caller namespaces each child's rendezvous keys, but the Store may use
+  // the parent's live connection. Implementations that block while holding or
+  // mutate connection-global state, such as the timeout, must clone it first.
   virtual c10::intrusive_ptr<Backend> split(
       const c10::intrusive_ptr<Store>& store,
       const std::vector<int>& ranks,
