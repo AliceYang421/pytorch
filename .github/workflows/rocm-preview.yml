@@ -78,6 +78,7 @@ jobs:
       - target-determination
     with:
       build-environment: ${{ needs.linux-noble-rocm-preview-py3_12-build.outputs.build-environment }}
+      rocm-arch-list: gfx950
       docker-image: ${{ needs.linux-noble-rocm-preview-py3_12-build.outputs.docker-image }}
       test-matrix: ${{ needs.linux-noble-rocm-preview-py3_12-build.outputs.test-matrix }}
     secrets: inherit
