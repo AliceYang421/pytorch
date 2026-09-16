@@ -450,6 +450,25 @@ def is_wait_tensor(node: torch.fx.Node) -> bool:
     )
 
 
+def deduplicate_wait_tensors(graph: torch.fx.Graph) -> None:
+    """Keep the first wait on each FX value and remove later no-op waits."""
+    canonical_waits: dict[torch.fx.Node, torch.fx.Node] = {}
+    waits = graph.find_nodes(
+        op="call_function",
+        target=torch.ops._c10d_functional.wait_tensor.default,
+    )
+    for wait in waits:
+        collective = wait.args[0]
+        if not isinstance(collective, torch.fx.Node):
+            continue
+        canonical_wait = canonical_waits.get(collective)
+        if canonical_wait is None:
+            canonical_waits[collective] = wait
+            continue
+        wait.replace_all_uses_with(canonical_wait)
+        graph.erase_node(wait)
+
+
 def is_all_reduce_tensor(node: torch.fx.Node) -> bool:
     return (
         node.op == "call_function"
