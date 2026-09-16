@@ -607,6 +607,41 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         # Nothing pinned: nothing to report, whatever the frames say.
         self.assertEqual(_wont_generalize({("TENSOR_MATCH", "x")}, guard_sets), ())
 
+    def test_varying_guard_slots_are_the_differing_and_present_in_some_ones(self):
+        from torch._dynamo.precompile_package import _varying_guard_slots
+        from torch.compiler._precompile_types import GuardFact
+
+        x_f32 = GuardFact("TENSOR_MATCH", "L['x']", (), "dtype=float32", True)
+        x_f16 = GuardFact("TENSOR_MATCH", "L['x']", (), "dtype=float16", True)
+        flag = GuardFact("CONSTANT_MATCH", "L['flag']", ("L['flag'] == 1",), "", True)
+        fn_id = GuardFact("ID_MATCH", "G['fn']", (), "is mod.fn", False)
+        # Same check as fn_id, only the filter's verdict differs.
+        fn_id_kept = GuardFact("ID_MATCH", "G['fn']", (), "is mod.fn", True)
+        frame = ("forward", "m.py", 12)
+
+        self.assertEqual(_varying_guard_slots({}), frozenset())
+        # One variant discriminates nothing.
+        self.assertEqual(
+            _varying_guard_slots({frame: [frozenset({x_f32, flag, fn_id})]}),
+            frozenset(),
+        )
+        varying = _varying_guard_slots(
+            {frame: [frozenset({x_f32, fn_id}), frozenset({x_f16, flag, fn_id_kept})]}
+        )
+        self.assertEqual(
+            varying,
+            frozenset({("TENSOR_MATCH", "L['x']"), ("CONSTANT_MATCH", "L['flag']")}),
+        )
+        # Frames are never compared with each other: the same slot pinned to
+        # different values in two frames is invariant within each.
+        other = ("torch_dynamo_resume_in_forward_at_14", "m.py", 14)
+        self.assertEqual(
+            _varying_guard_slots(
+                {frame: [frozenset({x_f32})], other: [frozenset({x_f16})]}
+            ),
+            frozenset(),
+        )
+
 
 instantiate_parametrized_tests(TestPrecompilePackage)
 
