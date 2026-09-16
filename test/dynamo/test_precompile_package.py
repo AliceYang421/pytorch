@@ -1,8 +1,11 @@
 # Owner(s): ["module: dynamo"]
 
 import math
+import os
 import traceback
 import xml.parsers.expat  # noqa: F401
+
+import numpy
 
 import torch
 import torch._dynamo.precompile_package as dynamo_package_lint
@@ -116,6 +119,23 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         self.assertEqual(drop_first(entries), [False, False, False])
         with self.assertRaisesRegex(ValueError, "returned 1 decisions for 3 guards"):
             compose(lambda es: [True])(entries)
+
+    def test_roots_tell_the_stdlib_install_and_torch_dirs_apart(self):
+        stdlib = dynamo_package_lint._stdlib_roots()
+        install = dynamo_package_lint._install_roots()
+        torch_roots = dynamo_package_lint._torch_roots()
+        self.assertTrue(stdlib and install and torch_roots)
+        # purelib nests inside a stdlib root (conda) or platstdlib (venv), so
+        # the two sets must stay distinguishable for the exclusion to work.
+        self.assertEqual(set(stdlib) & set(install), set())
+        norm, within = dynamo_package_lint._norm, dynamo_package_lint._within
+        self.assertTrue(within(norm(os.__file__), stdlib))
+        self.assertTrue(within(norm(numpy.__file__), install))
+        self.assertIn(norm(os.path.dirname(torch.__file__)), torch_roots)
+        root = os.path.join(os.sep, "a", "b")
+        self.assertTrue(within(root, (root,)))
+        self.assertTrue(within(os.path.join(root, "c"), (root,)))
+        self.assertFalse(within(root + "c", (root,)))
 
 
 instantiate_parametrized_tests(TestPrecompilePackage)
