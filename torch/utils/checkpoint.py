@@ -1501,6 +1501,14 @@ class CheckpointPolicy(enum.Enum):
         NOT equivalent to not using checkpointing. Using such a policy would
         save additional tensors not limited to ones that are actually needed for
         gradient computation.
+
+        Selective checkpointing saves non-aliasing ordered effects that are valid
+        SAC cache boundaries instead of replaying them under preferred recompute
+        or CPU-offload policies. Mandatory policies remain authoritative. Effects
+        may be registered explicitly through
+        ``torch.library._register_effectful_op`` or inferred from TorchBind
+        arguments. Raw c10d launches are not valid cache boundaries and remain
+        unsupported in recomputed SAC regions.
     """
     MUST_SAVE = 0
     PREFER_SAVE = 1
@@ -1510,9 +1518,32 @@ class CheckpointPolicy(enum.Enum):
     PREFER_CPU_OFFLOAD = 5
 
 
+# Policies for which eager SAC actually caches the output. CPU offload policies
+# currently fall through to recomputation, so they are deliberately absent.
+_SAVE_POLICIES = (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE)
+_EFFECT_OVERRIDE_POLICIES = (
+    CheckpointPolicy.PREFER_RECOMPUTE,
+    CheckpointPolicy.PREFER_CPU_OFFLOAD,
+)
+
+
 def _policy_from_bool(b):
     # For backward compatibility
     return CheckpointPolicy.MUST_SAVE if b else CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _is_cacheable_effect(op) -> bool:
+    """Return whether SAC can cache an effectful op instead of replaying it.
+
+    Raw c10d launches mutate their inputs and return an asynchronous Work handle,
+    so their return value is not a valid cache boundary. They remain unsupported
+    in recomputed eager SAC regions, where they may be launched again during
+    backward. Use functional collectives instead; the AOT partitioner preserves
+    those separately.
+    """
+    from torch._higher_order_ops.effects import has_effects
+
+    return has_effects(op) and op.namespace != "c10d"
 
 
 SAC_IGNORED_OPS = {
@@ -1589,6 +1620,8 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                                 func, *args, **kwargs)
         if isinstance(policy, bool):
             policy = _policy_from_bool(policy)
+        if policy in _EFFECT_OVERRIDE_POLICIES and _is_cacheable_effect(func):
+            policy = CheckpointPolicy.MUST_SAVE
 
         if is_compiling:
             if proxy_mode is not None:
@@ -1597,7 +1630,7 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                 for node in itertools.islice(reversed(graph.nodes), num_new):
                     node.meta["recompute"] = policy
 
-        if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE) or is_compiling:
+        if policy in _SAVE_POLICIES or is_compiling:
             # SAC caches these tensors outside the autograd graph, bypassing
             # SavedVariable, so simulate pack/unpack with the user's
             # saved-tensors hooks (if any): hooks like save_on_cpu must see
