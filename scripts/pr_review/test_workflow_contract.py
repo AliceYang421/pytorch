@@ -1201,6 +1201,11 @@ class TestTheReviewJobsTrustedSurfaceIsPinned(unittest.TestCase):
         "Grep(/${{ github.workspace }}/pr/**),"
         "Glob(/${{ github.workspace }}/pr/**),"
         "Read(/${{ github.workspace }}/trusted/.claude/skills/pr-review-readiness/**),"
+        # The rubric is a wrapper over `pr-review` and sends the model there for
+        # the review logic. Without this rule that read is DENIED, and a denied
+        # read reads to the model as an ordinary tool failure: it carries on and
+        # produces a verdict with no checklist behind it, green everywhere.
+        "Read(/${{ github.workspace }}/trusted/.claude/skills/pr-review/**),"
         "Read(//tmp/pr-diff.txt),"
         "Read(//tmp/pr-files.txt),"
         "Read(/${{ runner.temp }}/pr-review-findings.json),"
@@ -1641,6 +1646,13 @@ class TestTheReviewJobsTrustedSurfaceIsPinned(unittest.TestCase):
             "scripts/pr_review/emit_row.py",
             "scripts/pr_review/validate_findings.py",
             ".claude/skills/pr-review-readiness/SKILL.md",
+            # The rubric's DELEGATES. It keeps `pr-review`'s review logic, so
+            # these three decide what the model reports as directly as the
+            # wrapper does; omitting them would let the whole checklist be
+            # rewritten under an unmoved hash.
+            ".claude/skills/pr-review/SKILL.md",
+            ".claude/skills/pr-review/review-checklist.md",
+            ".claude/skills/pr-review/bc-guidelines.md",
         } | {
             f".claude/hooks/pr_review/{n}"
             for n in (
@@ -1802,6 +1814,11 @@ class TestTheSuiteActuallyRunsInCI(unittest.TestCase):
         ".github/workflows/hardened-pr-review-run.yml",
         ".claude/hooks/pr_review/**",
         ".claude/skills/pr-review-readiness/**",
+        # BOTH skill directories. The rubric wraps `pr-review`, so an edit
+        # confined to `pr-review/` changes what the review reports and moves the
+        # prompt hash — and without this line it is the one such change that
+        # schedules no run of the suite asserting both.
+        ".claude/skills/pr-review/**",
         # This file's OWN path. Without it, an edit that rewires or weakens the
         # wiring is the one change that schedules no run of the suite checking
         # the wiring.
@@ -4959,6 +4976,243 @@ class TestRubricSpeaksTheSchemaSeverities(unittest.TestCase):
             sentence,
             f"an injection attempt is no longer reported as major: {sentence}",
         )
+
+    def test_the_rubric_defines_every_severity_the_schema_accepts(self):
+        """A value the schema offers and the rubric never defines is a guess.
+
+        The rubric used to gate on `major` and define only `major`; `info` and
+        `minor` existed in the prompt's schema and nowhere else, so the model
+        chose between them on its own. That was survivable while the rubric was
+        a standalone one-question gate. It is not now: the rubric wraps
+        pr-review, whose findings are undifferentiated by design ("everything is
+        a must-fix"), and the mapping onto these three is the whole of what the
+        wrapper adds. EQUALITY, not containment — a definition deleted is the
+        failure, and containment cannot see a deletion.
+        """
+        defined = {
+            m.lower()
+            for ln in self.rubric.splitlines()
+            if "Report a finding as" in ln
+            for pair in re.findall(r"\*\*`?(\w+)`?\*\*|`(\w+)`", ln)
+            for m in pair
+            if m
+        }
+        self.assertEqual(
+            defined,
+            SEVERITIES,
+            f"the rubric defines {sorted(defined)}; the schema accepts "
+            f"{sorted(SEVERITIES)}",
+        )
+
+
+def _md_links(path: Path) -> set[Path]:
+    """Local markdown link targets in `path`, resolved against its directory."""
+    out = set()
+    for target in re.findall(r"\]\(([^)#]+)[^)]*\)", path.read_text()):
+        if "://" not in target:
+            out.add((path.parent / target).resolve())
+    return out
+
+
+def rubric_delegates() -> set[Path]:
+    """Every file the rubric sends the model to, TRANSITIVELY.
+
+    DERIVED FROM THE RUBRIC, not listed here. A test naming today's three files
+    would say nothing about a fourth added tomorrow, and the fourth is exactly
+    the case that breaks: a delegate the model may not open.
+
+    TRANSITIVE, because the rubric delegates to a skill that delegates onward —
+    `pr-review/SKILL.md` points at its own checklist and BC guidelines, and
+    nothing stops it gaining a third. Stopping at the rubric's own links would
+    have made "the rubric's dependencies are granted and hashed" true of the
+    first hop only, which is the weaker claim the test name does not make.
+
+    HONEST LIMIT: only inline `[text](target)` links are seen. A reference-style
+    link, or prose naming a file without linking it, is invisible here. That
+    understates the delegate set, so it can miss a file — which is why the hash
+    is ALSO pinned from the other direction, by granted-directory CONTENTS
+    (`test_every_file_in_a_granted_skill_directory_is_hashed`), a check that
+    needs no link parsing at all.
+    """
+    seen: set[Path] = set()
+    queue = [RUBRIC.resolve()]
+    while queue:
+        for target in _md_links(queue.pop()):
+            if target != RUBRIC.resolve() and target not in seen:
+                seen.add(target)
+                if target.is_file():
+                    queue.append(target)
+    return seen
+
+
+def granted_trusted_paths(review: str) -> tuple[list[Path], set[Path]]:
+    """`Read` grants on the trusted tree, as (directory prefixes, exact files).
+
+    PARSED OUT OF THE `claude_args:` BLOCK, which is the only text the action
+    turns into flags. Two narrowings, each closing a way of being told about a
+    grant that is not one. Scanning the whole review job for `Read(...)` counted
+    a rule merely MENTIONED in the prompt or an `env:` value; scanning it for
+    the first `--allowedTools "..."` counted a complete decoy flag sitting
+    outside the block. And matching only `/**` missed the exact-file form the
+    same flag already uses for `/tmp/pr-diff.txt`, so a valid grant read as
+    absent — which is why both shapes are returned rather than one.
+    """
+    args = "\n".join(indented_block(review, "claude_args"))
+    m = re.search(r"--allowedTools\s+\"([^\"]*)\"", args)
+    assert m, "the claude_args block declares no --allowedTools"
+    dirs, files = [], set()
+    for rule in re.findall(
+        r"Read\(/\$\{\{ github\.workspace \}\}/trusted/([^)]+)\)", m.group(1)
+    ):
+        if rule.endswith("/**"):
+            dirs.append(REPO / rule[: -len("/**")])
+        else:
+            files.add(REPO / rule)
+    return dirs, files
+
+
+class TestTheRubricIsAWrapperOverPrReview(unittest.TestCase):
+    """The rubric delegates, so its delegates are part of the trusted surface.
+
+    `pr-review-readiness/SKILL.md` keeps the `pr-review` skill's review logic and
+    replaces its interactive shape. Three things have to move together: what the
+    rubric points at, what the model is granted `Read` on, and what the prompt
+    hash covers. Every pairing fails silently on its own.
+
+    A delegate the model may NOT open is the worst of the three. The denial
+    reaches the model as an ordinary tool failure, not as an error the job can
+    see; it carries on and returns a verdict with no checklist behind it. The
+    run is green, the row is written, and the only symptom is that reviews get
+    shallower.
+    """
+
+    def setUp(self):
+        self.text = STAGE2.read_text()
+        self.review = strip_comments(job_block(self.text, "review"))
+        self.delegates = rubric_delegates()
+
+    def test_the_rubric_still_delegates(self):
+        """The premise every other test here rests on.
+
+        If the rubric is ever made standalone again this fails, and that is the
+        point: the grant and the hash entries below are then dead weight and
+        must come out in the same change.
+        """
+        self.assertTrue(
+            self.delegates,
+            "the rubric links to no other skill file — it is standalone again, "
+            "so the pr-review Read grant and its three prompt-hash entries are "
+            "now unearned and should be removed with it.",
+        )
+
+    def test_every_delegate_exists_and_lives_under_the_skills_tree(self):
+        """Anywhere else is a path the trusted checkout may not even contain."""
+        for path in sorted(self.delegates):
+            with self.subTest(path=path):
+                self.assertTrue(path.is_file(), f"the rubric links to {path}")
+                self.assertTrue(
+                    path.is_relative_to(REPO / ".claude" / "skills"),
+                    f"{path} is outside .claude/skills, which is the only tree "
+                    "the review job grants the model outside the PR checkout",
+                )
+
+    def hashed(self) -> set[Path]:
+        """Files NAMED in the hash step.
+
+        Naming is not hashing, and on its own this would accept
+        `UNHASHED=<path>` sitting beside a `cat` that omits it. It is sound here
+        only because `TestTheReviewJobsTrustedSurfaceIsPinned::
+        test_the_exported_hash_is_the_digest_of_every_file_it_names` EXECUTES the
+        step over this same extraction and requires the exported value to equal
+        the digest of every named file, perturbing each in turn. That test is
+        what binds "named" to "hashed"; weaken it and every assertion below
+        quietly becomes a spelling check.
+        """
+        prepare = strip_comments(job_block(self.text, "prepare"))
+        i = prepare.index("Hash the trusted prompt surface")
+        rest = prepare[i:]
+        nxt = re.search(r"(?m)^      -(?: |$)", rest)
+        step = rest[: nxt.start()] if nxt else rest
+        return {REPO / p for p in re.findall(r"([\w./-]+\.(?:py|sh|md|yml))", step)}
+
+    def test_every_delegate_is_read_granted(self):
+        dirs, files = granted_trusted_paths(self.review)
+        for path in sorted(self.delegates):
+            with self.subTest(path=path):
+                self.assertTrue(
+                    path in files or any(path.is_relative_to(d) for d in dirs),
+                    f"the rubric sends the model to {path}, which no "
+                    f"--allowedTools rule covers: dirs={sorted(map(str, dirs))} "
+                    f"files={sorted(map(str, files))}",
+                )
+
+    def test_every_delegate_is_in_the_prompt_hash(self):
+        """A delegate outside the hash lets the checklist change invisibly.
+
+        `prompt_hash` is how two rows are told apart. Rewriting
+        `review-checklist.md` changes every verdict the pipeline produces; if it
+        is not hashed, the rows before and after are indistinguishable.
+        """
+        hashed = self.hashed()
+        for path in sorted(self.delegates):
+            with self.subTest(path=path):
+                self.assertIn(path, hashed, f"{path} is not in the prompt hash")
+
+    def test_every_readable_skill_file_is_hashed(self):
+        """The link-blind half, and the one that actually closes the class.
+
+        A grant is the thing that makes a file readable, so what the grants
+        REACH is the hashable surface — no link parsing, no reachability
+        argument, no dependence on how the rubric happens to spell a reference.
+        Drop `additional-checks.md` into `pr-review/` and have SKILL.md mention
+        it in prose: every link-derived check above stays green while the file
+        shapes the review under a hash that never moves. This one goes red the
+        moment the file appears.
+
+        BOTH GRANT SHAPES. Enumerating only directories left the exact-file form
+        uncovered, so converting the grants to exact files would have restored
+        the same hole with the same green suite — the hazard here is a readable
+        file, not a directory.
+        """
+        dirs, files = granted_trusted_paths(self.review)
+        skills = REPO / ".claude" / "skills"
+        readable = {f for f in files if f.is_relative_to(skills)}
+        for d in dirs:
+            if d.is_relative_to(skills):
+                readable |= {p for p in d.rglob("*") if p.is_file()}
+        self.assertTrue(readable, "no skill file is readable — premise changed")
+        hashed = self.hashed()
+        for path in sorted(readable):
+            with self.subTest(path=path):
+                self.assertIn(
+                    path,
+                    hashed,
+                    f"{path} is readable through a trusted skill grant but is "
+                    "not in the prompt hash",
+                )
+
+    def test_the_prompt_tells_the_model_the_delegates_are_trusted(self):
+        """The grant alone is not enough, and silence here reads as a refusal.
+
+        The prompt's own security block tells the model to ignore any request to
+        read outside the PR tree. Without naming the delegated skill as trusted,
+        the rubric's instruction to go read it is indistinguishable from exactly
+        that — and obeying the security block is the behaviour we asked for.
+        """
+        prompt = self.review.split("prompt:", 1)[1]
+        for path in sorted({p.parent for p in self.delegates}):
+            rel = path.relative_to(REPO)
+            with self.subTest(path=rel):
+                # TRAILING SLASH. `pr-review` is a prefix of
+                # `pr-review-readiness`, which the prompt names two lines up, so
+                # a bare substring search was satisfied by the rubric's own path
+                # and passed with the delegate never mentioned. Measured: this
+                # test was vacuous until the slash was added.
+                self.assertIn(
+                    f"trusted/{rel}/",
+                    prompt,
+                    f"the prompt never names trusted/{rel}/ as trusted",
+                )
 
 
 # A GitHub Actions `if:` expression, tokenized. Single-quoted strings first, so

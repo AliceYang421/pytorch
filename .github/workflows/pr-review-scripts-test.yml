@@ -13,8 +13,11 @@ on:
       - ".github/workflows/pr-review-scripts-test.yml"
       # The rubric is under contract here too: the suite asserts it names no
       # severity the sanitizer would drop. Without this line a rubric-only
-      # change skips the one check that would catch it.
+      # change skips the one check that would catch it. BOTH directories — the
+      # rubric is a wrapper over pr-review, so an edit there changes the review
+      # and must move the prompt hash the suite checks.
       - ".claude/skills/pr-review-readiness/**"
+      - ".claude/skills/pr-review/**"
   pull_request:
     paths:
       - "scripts/pr_review/**"
@@ -24,8 +27,11 @@ on:
       - ".github/workflows/pr-review-scripts-test.yml"
       # The rubric is under contract here too: the suite asserts it names no
       # severity the sanitizer would drop. Without this line a rubric-only
-      # change skips the one check that would catch it.
+      # change skips the one check that would catch it. BOTH directories — the
+      # rubric is a wrapper over pr-review, so an edit there changes the review
+      # and must move the prompt hash the suite checks.
       - ".claude/skills/pr-review-readiness/**"
+      - ".claude/skills/pr-review/**"
 
 permissions:
   contents: read
