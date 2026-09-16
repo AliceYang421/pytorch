@@ -110,6 +110,8 @@ class TestTransportRegistry(TestCase):
         register_transport("test", _TestTransport)
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_transport("test", _TestTransport)
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            register_transport("tcp", _TestTransport)
 
     def test_factory_must_be_callable(self):
         with self.assertRaisesRegex(TypeError, "must be callable"):
@@ -161,7 +163,7 @@ class TestTransportRegistry(TestCase):
         with patch.object(
             _registry, "_iter_entry_points", return_value=iter([entry_point])
         ):
-            self.assertEqual(available_transports(), ("external",))
+            self.assertEqual(available_transports(), ("external", "tcp"))
 
 
 @instantiate_parametrized_tests
