@@ -10,7 +10,7 @@ from model_registry import ExampleCode, ModelWithKwargs, MultiMLP
 
 import torch
 import torch.distributed as dist
-import torch.distributed.pipelining.stage as stage_module
+import torch.distributed.pipelining._p2p as p2p_module
 from torch.distributed.pipelining import (
     build_stage,
     pipeline,
@@ -72,9 +72,9 @@ class PipelineStageBackendWarningTest(TestCase):
     def test_eager_nccl_warning(self, backend, should_warn):
         with (
             mock.patch.object(dist, "get_backend", return_value=backend),
-            mock.patch.object(stage_module, "warning_once") as warning,
+            mock.patch.object(p2p_module, "warning_once") as warning,
         ):
-            stage_module._warn_if_eager_nccl(None)
+            p2p_module._warn_if_eager_nccl(None)
 
         if should_warn:
             warning.assert_called_once()
