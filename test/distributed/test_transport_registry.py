@@ -163,7 +163,9 @@ class TestTransportRegistry(TestCase):
         with patch.object(
             _registry, "_iter_entry_points", return_value=iter([entry_point])
         ):
-            self.assertEqual(available_transports(), ("external", "tcp"))
+            self.assertEqual(
+                available_transports(), ("external", "tcp", "torchcomms", "ucxx")
+            )
 
 
 @instantiate_parametrized_tests
